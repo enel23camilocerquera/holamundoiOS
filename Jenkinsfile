@@ -5,20 +5,19 @@ pipeline {
         string(name: 'PROJECT_NAME', defaultValue: 'holamundoiOS', description: 'Nombre del .xcodeproj / .xcworkspace (sin extensión)')
         string(name: 'SCHEME', defaultValue: 'holamundoiOS', description: 'Scheme de Xcode a compilar')
         choice(name: 'CONFIGURATION', choices: ['Release', 'Debug'], description: 'Configuración de build')
-        choice(name: 'EXPORT_METHOD', choices: ['development', 'ad-hoc', 'app-store-connect', 'enterprise'], description: 'Método de exportación del .ipa')
-        string(name: 'TEAM_ID', defaultValue: '', description: 'Apple Developer Team ID (10 caracteres)')
+        string(name: 'DEVELOPER_DIR', defaultValue: '/Applications/Xcode.app/Contents/Developer', description: 'Ruta del Xcode a usar en el agente')
     }
 
     environment {
-        BUILD_DIR    = "${WORKSPACE}/build"
-        ARCHIVE_PATH = "${WORKSPACE}/build/${params.SCHEME}.xcarchive"
-        EXPORT_PATH  = "${WORKSPACE}/build/ipa"
-        LANG         = 'en_US.UTF-8'
+        BUILD_DIR     = "${WORKSPACE}/build"
+        ARCHIVE_PATH  = "${WORKSPACE}/build/${params.SCHEME}.xcarchive"
+        DEVELOPER_DIR = "${params.DEVELOPER_DIR}"
+        LANG          = 'en_US.UTF-8'
     }
 
     options {
         timestamps()
-        timeout(time: 45, unit: 'MINUTES')
+        timeout(time: 30, unit: 'MINUTES')
         buildDiscarder(logRotator(numToKeepStr: '10'))
     }
 
@@ -31,8 +30,12 @@ pipeline {
 
         stage('Build & Generate IPA') {
             steps {
+                // Compilación sin firma: no requiere certificados ni Apple ID.
+                // El .ipa resultante NO está firmado (no se puede instalar ni subir a tienda).
                 sh '''
                     set -eo pipefail
+                    xcodebuild -version
+
                     rm -rf "$BUILD_DIR"
                     mkdir -p "$BUILD_DIR"
 
@@ -43,43 +46,27 @@ pipeline {
                         BUILD_TARGET="-project ${PROJECT_NAME}.xcodeproj"
                     fi
 
-                    # ExportOptions.plist
-                    cat > "$BUILD_DIR/ExportOptions.plist" <<EOF
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>method</key>
-    <string>${EXPORT_METHOD}</string>
-    <key>teamID</key>
-    <string>${TEAM_ID}</string>
-    <key>signingStyle</key>
-    <string>automatic</string>
-    <key>compileBitcode</key>
-    <false/>
-    <key>stripSwiftSymbols</key>
-    <true/>
-</dict>
-</plist>
-EOF
-
-                    # 1. Compilar y archivar
+                    # 1. Compilar y archivar sin firma
                     xcodebuild $BUILD_TARGET \
                         -scheme "$SCHEME" \
                         -configuration "$CONFIGURATION" \
                         -sdk iphoneos \
                         -destination 'generic/platform=iOS' \
                         -archivePath "$ARCHIVE_PATH" \
-                        DEVELOPMENT_TEAM="$TEAM_ID" \
-                        -allowProvisioningUpdates \
+                        CODE_SIGNING_ALLOWED=NO \
+                        CODE_SIGNING_REQUIRED=NO \
+                        CODE_SIGN_IDENTITY="" \
                         clean archive
 
-                    # 2. Exportar el .ipa
-                    xcodebuild -exportArchive \
-                        -archivePath "$ARCHIVE_PATH" \
-                        -exportPath "$EXPORT_PATH" \
-                        -exportOptionsPlist "$BUILD_DIR/ExportOptions.plist" \
-                        -allowProvisioningUpdates
+                    # 2. Empaquetar el .ipa (Payload/<app>.app -> .ipa)
+                    APP_PATH=$(find "$ARCHIVE_PATH/Products/Applications" -maxdepth 1 -name "*.app" | head -n 1)
+                    [ -n "$APP_PATH" ] || { echo "No se encontró el .app en el archive"; exit 1; }
+
+                    mkdir -p "$BUILD_DIR/ipa/Payload"
+                    cp -R "$APP_PATH" "$BUILD_DIR/ipa/Payload/"
+                    (cd "$BUILD_DIR/ipa" && zip -qry "$SCHEME.ipa" Payload && rm -rf Payload)
+
+                    ls -lh "$BUILD_DIR/ipa"
                 '''
             }
             post {
